@@ -1,13 +1,14 @@
+import logging
+import re
+import subprocess
 import sys
 import requests
 import m3u8
-#from . import m3u8
 import os
 import concurrent.futures
 import threading
 import time
 from Crypto.Cipher import AES
-import hashlib
 import argparse
 
 class m3u8_downloder:
@@ -19,14 +20,12 @@ class m3u8_downloder:
     }
     max_try_count = 20
     cipher = None
-    def __init__(self, threads=6, max_bitrate=False, DEBUG=False, proxies={}, progress_bar=True):
+    def __init__(self, threads=6, proxies={}, progress_bar=True, logger=logging.getLogger('m3u8_dl')):
         '''
         thread: download ts threads
         max_bitrate: True: select max_bitrate, False: select minbitrate
         '''
         self.threads = threads
-        self.max_bitrate = max_bitrate
-        self.DEBUG = DEBUG
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         self.session.proxies.update(proxies)
@@ -42,78 +41,72 @@ class m3u8_downloder:
         self.done = [0]*self.threads
         self.byte = [0]*self.threads
         
-        self.log_out = sys.stdout
-        self.log_err = sys.stderr
-
-    def log(self, level, *args):
-        if level==3 and not self.DEBUG:
-            return
-        prompt = ["Error", "Warning", "Info", "Debug"]
-        if level==0 or level==1: #ERROR or WARNING
-            print(f"[{prompt[level]:>7s}]:", *args, file=self.log_err)
-        else:
-            print(f"[{prompt[level]:>7s}]:", *args, file=self.log_out)
+        self.logger = logger
 
     def get(self, url, **kwargs):
         try_count = self.max_try_count
-        succeed = True
+        success = True
         while True:
             try:
                 response = self.session.get(url, **kwargs)
                 if response.status_code != 200:     #maybe site detected too quickly download
                     try_count -= 1
                     if try_count==0:
-                        self.log(1, f"GET {url} exceed max retry times{response.status_code}")
-                        succeed = False
+                        self.logger.warning(f"\nGET {url} exceed max retry times {response.status_code}")
+                        success = False
                         break
                     continue
                 break
             except:
                 try_count -= 1
                 if try_count==0:
-                    self.log(1, f"GET {url}", sys.exc_info()[0])
-                    succeed = False
+                    self.logger.warning(f"\nGET {url} got exception")
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    print("Exception type:", exc_type)
+                    print("Exception value:", exc_value)
+                    print("Exception traceback:", exc_traceback)
+                    success = False
                     break
-        return response, succeed
+            time.sleep(0.1)
+        return response, success
 
     def run_cmd(self, cmd):
-        if self.DEBUG:
-            self.log(3, "OS:", cmd)
-        p = os.popen(cmd)
-        output = p.read()
+        self.logger.debug(f"run cmd: {cmd}")
+        r = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL)
+        return r.returncode
 
-    def get_m3u8_info(self, m3u8_url):
-        self.log(3, f"GET {m3u8_url}")
-        response, _ = self.get(m3u8_url, timeout=20)
+    def get_m3u8_info(self, m3u8_url, select_max_bitrate=True):
+        self.logger.debug(f"get m3u8 info: {m3u8_url}")
+        response, success = self.get(m3u8_url, timeout=20)
+        if not success:
+            self.logger.error(f"get m3u8 url failed: {m3u8_url}")
+            exit(1)
         m3u8_info = m3u8.loads(response.text)
         
         self.m3u8_url_base = '/'.join(m3u8_url.split('/')[:-1]) + '/'
-        if m3u8_info.is_variant:
-            self.log(3, f"m3u8 is variant: {len(m3u8_info.playlists)} total")
-            # select max bitrate m3u8
-            max_bitrate = m3u8_info.playlists[0].stream_info.bandwidth
-            max_playlist = m3u8_info.playlists[0]
-            for playlist in m3u8_info.playlists[1:]:
-                if self.max_bitrate:
-                    if playlist.stream_info.bandwidth > max_bitrate:
-                        max_bitrate = playlist.stream_info.bandwidth
-                        max_playlist = playlist
-                else:
-                    if playlist.stream_info.bandwidth < max_bitrate:
-                        max_bitrate = playlist.stream_info.bandwidth
-                        max_playlist = playlist
-            self.log(3, f"select bitrate: {max_bitrate}")
+        if m3u8_info.is_variant: # contains multiple sub m3u8
+            self.logger.info(f"m3u8 is variant: {len(m3u8_info.playlists)} total")
+            for i, playlist in enumerate(m3u8_info.playlists):
+                self.logger.info(f"{i}: {playlist.stream_info.bandwidth} {playlist.uri[:20]}...")
+            if select_max_bitrate:
+                bitrate_list = [playlist.stream_info.bandwidth for playlist in m3u8_info.playlists]
+                playlist_sel = m3u8_info.playlists[bitrate_list.index(max(bitrate_list))]
+                self.logger.info(f"select max bitrate: {playlist_sel.stream_info.bandwidth}")
+            else: # interactive select
+                select = int(input("select: "))
+                playlist_sel = m3u8_info.playlists[select]
+
             # request again
-            return self.get_m3u8_info(self.m3u8_url_base + max_playlist.uri)
+            return self.get_m3u8_info(self.m3u8_url_base + playlist_sel.uri)
         
         m3u8_path = os.path.join(self.cache_path_uuid, "index.m3u8")
         with open(m3u8_path, "w", encoding='utf-8') as fp:
             fp.write(response.text)
-        # self.log(2, f"save m3u8: {m3u8_path}")
+        self.logger.debug(f"save m3u8: {m3u8_path}")
         return m3u8_info
 
     def get_key(self, m3u8_info):
-        self.log(2, f"m3u8 is encrypted")
+        self.logger.info(f"m3u8 is encrypted")
         
         if self.recover_mode:
             key_path = os.path.join(self.cache_path_uuid, 'key')
@@ -122,31 +115,33 @@ class m3u8_downloder:
                     key_bytes = fp.read(16)
                     iv = fp.read(16)
                 self.cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
-                self.log(3, f"read key, key:", len(key_bytes), key_bytes, "iv:", iv)
+                self.logger.debug(f"read key, key len: {len(key_bytes)} \nkey: {key_bytes} \niv: {iv}")
                 return
             else:
-                self.log(2, f"key not found, try to download")
+                self.logger.warning(f"key not found, try to download")
         
         key = m3u8_info.keys[0]
         if key.method != "AES-128":
-            self.log(0, f"{key.method} not supported(only AES-128)")
-            exit(-1)
+            self.logger.error(f"{key.method} not supported(only AES-128)")
+            exit(1)
         key_url = key.uri
         if not key_url.startswith("http"):
             key_url = self.m3u8_url_base + key_url
         
-        self.log(2, f"download key: {key_url}")
+        self.logger.info(f"download key: {key_url}")
         response, _ = self.get(key_url)
         key_bytes = response.content
         iv = key_bytes
         
         if key.iv is not None:
+            # hex string
             if key.iv.startswith('0x'): #0x9102194531bb4f6cad45ad87c3bd8399
                 s = key.iv[2:]
                 byte_list = []
                 for i in range(0, 32, 2):
                     byte_list.append(int(s[i:i+2], base=16))
                 iv = bytes(byte_list)
+            # bytes
             else:
                 iv = key.iv
             self.cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
@@ -158,16 +153,20 @@ class m3u8_downloder:
         with open(key_path, "wb") as fp:
             fp.write(key_bytes)
             fp.write(iv)
-        self.log(3, f"write key, key:", len(key_bytes), key_bytes, "iv:", iv)
+        self.logger.debug(f"save key, key len: {len(key_bytes)} \nkey: {key_bytes} \niv: {iv}")
 
+    def get_uuid(self, name):
+        # h = hashlib.sha224(name.encode('utf-8')).hexdigest()
+        h = re.sub(r'[\\/:*?"<>|]', '_', name)
+        return h
     def mk_cache_path_uuid(self, name, cache_path):
         self.recover_mode = False
         #mk unique ts cache path
-        h = hashlib.sha224(name.encode('utf-8')).hexdigest()
+        h = self.get_uuid(name)
         self.cache_path_uuid = os.path.join(cache_path, h)
         if os.path.exists(self.cache_path_uuid):
             self.recover_mode = True
-            self.log(2, "recover mode")
+            self.logger.info(f"recover mode, found cache in {self.cache_path_uuid}")
         else:
             os.mkdir(self.cache_path_uuid)
 
@@ -190,11 +189,10 @@ class m3u8_downloder:
     def download_ts(self, ts_urls):
         def download(ts, ts_url):
             tid = int(threading.current_thread().name.split('_')[-1]) #ThreadPoolExecutor-0_2
-            # self.log(3, tid, ts)
-            response, succeed = self.get(ts_url, stream=True)
-            if succeed == False:
-                self.log(0, f"{ts} download failed")
-                self.done[tid] += 1
+            response, success = self.get(ts_url, stream=True)
+            if success == False:
+                self.logger.warning(f"{ts} download failed. Skip")
+                self.done[tid] += 1  # still add 1, so that progress bar can reach 100% and exit loop
                 return
             
             ts_path = os.path.join(self.cache_path_uuid, ts)
@@ -223,54 +221,66 @@ class m3u8_downloder:
                 byte = sum(self.byte)
                 delta = byte - byte_pre
                 byte_pre = byte
+                cur_time = time.time()
+                elapsed_time = cur_time - start_time
+                remain_time = elapsed_time*(total-done)/done if done!=0 else 1e10
+                human_time = time.strftime("%H:%M:%S", time.gmtime(remain_time))
                 
                 self.percent = percent
                 self.speed = delta/1024
                 if self.progress_bar:
-                    print(f"\r{done:>4d}/{total:<4d}:{bar1*'■'}{bar2*'□'}:{percent:.2%} {delta/1024:>8.0f}KB/s", flush=True, end='')
+                    print(f"\r{done:>4d}/{total:<4d}:{bar1*'■'}{bar2*'□'}:{percent:.2%} {delta/1024:>8.0f}KB/s, remain: {human_time}", flush=True, end='')
         end_time = time.time()
-        self.log(2, f'avg speed{byte/(end_time-start_time)/1024:>8.0f}KB/s')
+        print(f'\navg speed{byte/(end_time-start_time)/1024:>8.0f}KB/s')
 
-    def merge_ts(self, ts_urls):
-        output_flv = os.path.join(self.cache_path_uuid, "cache.flv")
-        out = open(output_flv, "wb+")
-        for ts in ts_urls.keys():
-            ts_path = os.path.join(self.cache_path_uuid, ts)
-            try:
-                with open(ts_path, "rb") as fp:
-                    content = fp.read()
-                    # content += b'\0'*((16 - len(content)%16)%16)
-                    if self.cipher is None:
-                        out.write(content)
-                    else:
-                        out.write(self.cipher.decrypt(content))
-            except:
-                self.log(0, f"merge failed: {ts} miss")
-                exit(-1)
-        out.close()
-        return output_flv
+    def new_merge(self, ts_files, download_path, filename, format='mkv'):
+        # ts_paths = [os.path.join(self.cache_path_uuid, ts) for ts in ts_urls.keys()]
+        ts_paths = [os.path.join(self.cache_path_uuid, ts) for ts in ts_files]
+        ts_paths.sort() # increase order
+        ts_files_path = os.path.join(self.cache_path_uuid, "ts_files.txt")
+        with open(ts_files_path, "w") as f:
+            for ts_file in ts_files:
+                f.write(f"file '{ts_file}'\n")
+        
+        filepath = os.path.join(download_path, f"{filename}.{format}")
+        self.logger.info(f"merge ts in {self.cache_path_uuid} to {filepath}")
+        cmd = f"ffmpeg -hide_banner -y -f concat -safe 0 -i {ts_files_path} -c copy {filepath}"
+        return_code = self.run_cmd(cmd)
+        if return_code != 0:
+            self.logger.error(f"merge failed: {filepath}")
+            exit(1)
     
     def get_progress(self):
         return f'{self.percent*100:.0f}% {self.speed:.0f} KB/s'
 
-    def download(self, m3u8_url, name, download_path='./', cache_path='./cache'):
+    def remove_cache(self):
+        self.run_cmd(f"rm -rf {self.cache_path_uuid}")
+        
+        # remove cache dir if empty
+        cache_dir = os.path.dirname(self.cache_path_uuid)
+        file_list = os.listdir(cache_dir)
+        if len(file_list)==0:
+            self.run_cmd(f"rm -rf {cache_dir}")
+        self.logger.info(f"clean cache")
+    
+    def download(self, m3u8_url, filename, ext, download_path='./', cache_path='./cache',\
+        keep_cache=False, select_max_bitrate=True):
+        self.logger.info(f"download {m3u8_url} to {download_path}/{filename}.mp4")
         #mkdir
         if not os.path.exists(cache_path):
             os.mkdir(cache_path)
         if not os.path.exists(download_path):
-            print(f"download path {download_path} not exist")
+            self.logger.error(f"download path {download_path} not exist, exit")
             exit(1)
         #uuid cache path
-        self.mk_cache_path_uuid(name, cache_path)
-        #err log
-        self.log_err = open(os.path.join(self.cache_path_uuid, "error.log"), "w", encoding='utf-8')
+        self.mk_cache_path_uuid(filename, cache_path)
 
         #get m3u8 info
-        m3u8_info = self.get_m3u8_info(m3u8_url)
+        m3u8_info = self.get_m3u8_info(m3u8_url, select_max_bitrate=select_max_bitrate)
         
         #get ts url
         ts_urls = self.get_ts_urls(m3u8_info)
-        self.log(2, f"{len(ts_urls)} ts segments")
+        self.logger.info(f"{len(ts_urls)} ts segments")
 
         #if encrypted, get key
         if len(m3u8_info.keys)!=0 and m3u8_info.keys[0] is not None:
@@ -281,60 +291,52 @@ class m3u8_downloder:
         miss_ts_urls = ts_urls
         if self.recover_mode:
             miss_ts_urls = self.get_miss_ts_urls(ts_urls)
-        self.log(2, f"{len(miss_ts_urls)} missed ts segments")
+        self.logger.info(f"{len(miss_ts_urls)} ts segments need to download")
         
         self.download_ts(miss_ts_urls)
-        self.log(2, f"download ts finish: {self.cache_path_uuid}")
+        self.logger.info(f"download ts finish: {self.cache_path_uuid}")
         
-        #merge ts to flv
-        output_flv = self.merge_ts(ts_urls)
-        self.log(2, f"merge ts to flv: {output_flv}")
-
-        #convert to mp4
-        output_mp4 = os.path.join(download_path, name+".mp4")
-        log = os.path.join(self.cache_path_uuid, "ffmpeg_error.log")
-        self.run_cmd(f"ffmpeg -y -i {output_flv} -c copy \"{output_mp4}\" > {log} 2>&1")
-        self.log(2, f"ffmpeg convert flv to mp4: {output_mp4}")
-
+        # new merege
+        ts_files = ts_urls.keys()
+        self.new_merge(ts_files, download_path, filename, format=ext)
+        
         #remove cache
-        self.run_cmd(f"rm -rf {output_flv}")
-        self.run_cmd(f"rm -rf {self.cache_path_uuid}")
-        self.log(2, f"clean cache")
+        if not keep_cache:
+            self.remove_cache()
+
+    def force_merge(self, filename, download_path='./', cache_path='./cache', ext="mkv", keep_cache=False):
+        self.cache_path_uuid = os.path.join(cache_path, self.get_uuid(filename))
+        if not os.path.exists(self.cache_path_uuid):
+            self.logger.error(f"cache path {self.cache_path_uuid} not exist, exit")
+            exit(1)
         
-        self.log_err.close()
+        files = os.listdir(self.cache_path_uuid)
+        ts_files = [ts for ts in files if ts.endswith('.ts')]
+        
+        self.new_merge(ts_files, download_path, filename, format=ext)
+        
+        #remove cache
+        if not keep_cache:
+            self.remove_cache()
 
-    def force_merge(self, cache_path_uuid, download_path='./', name="force_merge"):
-        def get_files_under_dir(dir):
-            '''获得dir目录下的所有文件
-            '''
-            for f in os.listdir(dir):
-                if os.path.isfile(os.path.join(dir, f)):
-                    yield f
-        self.cache_path_uuid = cache_path_uuid
-        self.recover_mode = True
-        self.get_key(None)
-
-        ts_urls = {}
-        files = get_files_under_dir(cache_path_uuid)
-        i = 0
-        for f in files:
-            if f.split('.')[-1]=="ts":
-                ts = f"{i:0>8d}.ts"
-                ts_urls[ts] = ""    #only care dict key
-                i += 1
-        self.log(2, f"ts count: {i}")
-        #merge ts to flv
-        output_flv = self.merge_ts(ts_urls)
-        self.log(2, f"merge ts to flv: {output_flv}")
-
-        #convert to mp4
-        output_mp4 = os.path.join(download_path, name+".mp4")
-        self.run_cmd(f"ffmpeg -y -i {output_flv} -c copy \"{output_mp4}\"")
-        self.log(2, f"ffmpeg convert flv to mp4: {output_mp4}")
+def get_logger(name, level=logging.INFO, filename="", overwrite=False, format='[%(asctime)s][%(levelname)-7s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'):
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = False # forbid print to root logger
+    if filename is None or filename == "":
+        file_handler = logging.StreamHandler(sys.stdout)
+    else:
+        if overwrite:
+            file_handler = logging.FileHandler(filename, mode='w')
+        else:
+            file_handler = logging.FileHandler(filename)
+    formatter = logging.Formatter(format, datefmt=datefmt)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    return logger
 
 if __name__=="__main__":
-    parser = argparse.ArgumentParser(description='m3u8 downloader：下载m3u8视频，并转换成mp4。1）支持多线程加速下载ts 2）支持variant m3u8 3）支持AES-128加密 4）支持显示进度条，网速 5）支持自动恢复下载 6）支持代理'
-                                     )
+    parser = argparse.ArgumentParser(description='m3u8 downloader.')
     parser.add_argument('-u', '--m3u8-url',
                     required=True,
                     default="https://playertest.longtailvideo.com/adaptive/oceans_aes/oceans_aes.m3u8",
@@ -350,13 +352,22 @@ if __name__=="__main__":
                     type=int,
                     default=6,
                     help='download thread number')
-    parser.add_argument('-m', '--max-bitrate',
+    parser.add_argument('-i', '--interactive',
                     action='store_true',
-                    help='select max bitrate')
+                    help='select variant m3u8 interactively, default select max bitrate video to download')
     parser.add_argument('-v', '--verbose',
                     action='store_true',
                     help='Verbose mode, print debug')
+    parser.add_argument('-k', '--keep-cache',
+                    action='store_true',
+                    help='don;t remove cache dir after merge')
+    parser.add_argument('-F', '--force-merge',
+                action='store_true',
+                help='force merge the ts in cache dir')
     args = parser.parse_args()
+    
+    logging.basicConfig(level=logging.INFO)  # set root logger
+    logger = get_logger('m3u8_dl', level=logging.DEBUG if args.verbose else logging.INFO, format='[%(asctime)s][%(levelname)-7s] - %(name)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     
     if args.proxy_url=="": #no proxy
         proxies = {}
@@ -366,22 +377,24 @@ if __name__=="__main__":
             'https': args.proxy_url
         }
     
-    downloader = m3u8_downloder(threads=args.thread_num, max_bitrate=True, DEBUG=args.verbose, proxies=proxies)
+    downloader = m3u8_downloder(threads=args.thread_num, proxies=proxies, logger=logger)
     
     video_output_dir = os.path.dirname(args.output)
     if video_output_dir=="":
         video_output_dir = "."
-    video_filename = os.path.basename(args.output)
+    video_file = os.path.basename(args.output)
+    video_filename = video_file.split('.')[0]
+    ext = video_file.split('.')[-1].lower()
+    supported_format = ['mp4', 'mkv']
+    if ext not in supported_format:
+        logger.error(f"{ext} not supported, supported format: {supported_format}")
+        exit(1)
     download_path = video_output_dir
     cache_path = os.path.join(download_path, "cache")
-    downloader.download(args.m3u8_url, video_filename, download_path=download_path, cache_path=cache_path)
+    if args.force_merge:
+        downloader.force_merge(video_filename, download_path=download_path, cache_path=cache_path, ext=ext, keep_cache=args.keep_cache)
+        exit(0)
+    downloader.download(args.m3u8_url, video_filename, download_path=download_path, cache_path=cache_path, ext=ext,\
+        keep_cache=args.keep_cache, select_max_bitrate=not args.interactive)
 
-# if __name__=="__main__":
-#     '''降cache_path下第一个找到的目录中的ts合并成mp4，保存在当前目录。name指定名称
-#     '''
-#     cache_path_uuid = sys.argv[1]
-
-#     downloader = m3u8_downloder(threads=6, max_bitrate=True, DEBUG=True, proxies={})
-#     downloader.force_merge(cache_path_uuid)
-
-
+    
